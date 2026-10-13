@@ -28,32 +28,12 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          [[ "$SCAN_ID" =~ ^[0-9]+$ ]] || {
-            echo "::error::scan_id must be a number"
-            exit 1
-          }
-          [ -n "$BACKEND_URL" ] || {
-            echo "::error::Set the BACKEND_URL repository variable"
-            exit 1
-          }
-          [ -n "$SCAN_SECRET" ] || {
-            echo "::error::Set the SCAN_SECRET repository secret"
-            exit 1
-          }
+          [[ "$SCAN_ID" =~ ^[0-9]+$ ]] || { echo "::error::scan_id must be a number"; exit 1; }
+          [ -n "$BACKEND_URL" ] || { echo "::error::Set BACKEND_URL repository variable"; exit 1; }
+          [ -n "$SCAN_SECRET" ] || { echo "::error::Set SCAN_SECRET repository secret"; exit 1; }
 
       - name: Checkout scanner tools
         uses: actions/checkout@v4
-
-      - name: Verify scanner files
-        shell: bash
-        run: |
-          set -euo pipefail
-          echo "Workspace: $GITHUB_WORKSPACE"
-          ls -la "$GITHUB_WORKSPACE/security/ci"
-          test -f "$GITHUB_WORKSPACE/security/ci/platform_client.py" || {
-            echo "::error::platform_client.py is missing from the checked-out commit"
-            exit 1
-          }
 
       - name: Set up Python
         uses: actions/setup-python@v5
@@ -61,17 +41,13 @@ jobs:
           python-version: "3.12"
 
       - name: Mark scan as running
-        shell: bash
         run: |
-          set -euo pipefail
-          python3 "$GITHUB_WORKSPACE/security/ci/platform_client.py" start \
+          python3 security/ci/platform_client.py start \
             --run-url "$GITHUB_SERVER_URL/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID"
 
       - name: Fetch repository details from the platform
-        shell: bash
         run: |
-          set -euo pipefail
-          python3 "$GITHUB_WORKSPACE/security/ci/platform_client.py" source \
+          python3 security/ci/platform_client.py source \
             --out "$RUNNER_TEMP/source.json"
 
       - name: Clone the repository to scan
@@ -79,43 +55,37 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           SRC="$RUNNER_TEMP/source.json"
           REPO=$(jq -er .repository "$SRC")
           BRANCH=$(jq -er .branch "$SRC")
           TOKEN=$(jq -er .token "$SRC")
           SLUG=$(jq -er .slug "$SRC")
-
           AUTH=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
           echo "::add-mask::$TOKEN"
           echo "::add-mask::$AUTH"
-
           TARGET="$RUNNER_TEMP/target/$SLUG"
           mkdir -p "$RUNNER_TEMP/target"
-
           git -c "http.https://github.com/.extraheader=AUTHORIZATION: basic $AUTH" \
             clone --depth 200 --branch "$BRANCH" \
             "https://github.com/$REPO.git" "$TARGET"
-
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
           echo "commit=$(git -C "$TARGET" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Build the Docker image (if available)
+      - name: Build Docker image if available
         id: image
         env:
           TARGET: ${{ steps.clone.outputs.target }}
         shell: bash
         run: |
           set -euo pipefail
-
           if [ -f "$TARGET/Dockerfile" ]; then
             if docker build -t "scan-target:$SCAN_ID" "$TARGET"; then
               echo "name=scan-target:$SCAN_ID" >> "$GITHUB_OUTPUT"
             else
-              echo "::warning::Docker build failed; Trivy will scan the source tree"
+              echo "::warning::Docker build failed; Trivy will scan source files"
             fi
           else
-            echo "No Dockerfile found; Trivy will scan the source tree"
+            echo "No Dockerfile; Trivy will scan source files"
           fi
 
       - name: Install Semgrep
@@ -125,51 +95,58 @@ jobs:
         uses: actions/cache@v4
         with:
           path: ~/.dependency-check-data
-          key: dependency-check-data-${{ runner.os }}-${{ github.run_id }}
+          key: dependency-check-data-v1-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
-            dependency-check-data-${{ runner.os }}-
+            dependency-check-data-v1-${{ runner.os }}-
 
-      - name: Run the four scanners
+      - name: Run Semgrep
+        env:
+          TARGET: ${{ steps.clone.outputs.target }}
+          SEMGREP_CONFIG: p/default
+        run: bash security/sast/run_semgrep.sh "$TARGET" reports
+
+      - name: Run Gitleaks
+        if: always()
+        env:
+          TARGET: ${{ steps.clone.outputs.target }}
+        run: bash security/secrets/run_gitleaks.sh "$TARGET" reports
+
+      - name: Run Trivy
+        if: always()
         env:
           TARGET: ${{ steps.clone.outputs.target }}
           IMAGE: ${{ steps.image.outputs.name }}
+        run: bash security/container/run_trivy.sh "$TARGET" reports "${IMAGE:-}"
+
+      - name: Run Dependency-Check
+        if: always()
+        env:
+          TARGET: ${{ steps.clone.outputs.target }}
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
-          SEMGREP_CONFIG: p/default
           PROJECT_NAME: scan-${{ inputs.scan_id }}
+          DEPENDENCY_CHECK_DATA_DIR: ${{ runner.temp }}/dependency-check-data
         shell: bash
         run: |
-          set -uo pipefail
-          mkdir -p reports
-
-          bash security/sast/run_semgrep.sh \
-            "$TARGET" reports || echo "::warning::Semgrep failed"
-
-          bash security/secrets/run_gitleaks.sh \
-            "$TARGET" reports || echo "::warning::Gitleaks failed"
-
-          bash security/container/run_trivy.sh \
-            "$TARGET" reports "${IMAGE:-}" || echo "::warning::Trivy failed"
-
-          bash security/dependency/run_dependency_check.sh \
-            "$TARGET" reports || echo "::warning::Dependency-Check failed"
+          set -euo pipefail
+          mkdir -p reports "$DEPENDENCY_CHECK_DATA_DIR"
+          bash security/dependency/run_dependency_check.sh "$TARGET" reports
 
       - name: Normalize results and evaluate security gate
+        if: always()
         env:
           COMMIT: ${{ steps.clone.outputs.commit }}
         shell: bash
         run: |
           set -euo pipefail
-
+          test -f "$RUNNER_TEMP/source.json"
+          test -f reports/semgrep.json || echo "::warning::Semgrep report may be missing"
           jq .gateConfig "$RUNNER_TEMP/source.json" > reports/gate-config.json
-
           python3 security/normalizer/normalize.py \
             --reports reports --output reports/normalized.json
-
           python3 security/security-gate/gate.py \
             --input reports/normalized.json \
             --output reports/gate-result.json \
             --config reports/gate-config.json || true
-
           python3 security/normalizer/to_backend_payload.py \
             --input reports/normalized.json \
             --gate reports/gate-result.json \
@@ -178,11 +155,10 @@ jobs:
 
       - name: Send results to the platform
         id: report
-        shell: bash
+        if: always() && hashFiles('reports/payload.json') != ''
         run: |
-          set -euo pipefail
-          python3 "$GITHUB_WORKSPACE/security/ci/platform_client.py" \
-            results --payload reports/payload.json
+          python3 security/ci/platform_client.py results \
+            --payload reports/payload.json
 
       - name: Upload security report
         if: always()
@@ -195,7 +171,7 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Deploy to Vercel when the gate passes
+      - name: Deploy to Vercel when gate passes
         if: steps.report.outputs.final_status == 'PASS' && steps.report.outputs.deploy == 'true'
         env:
           TARGET: ${{ steps.clone.outputs.target }}
@@ -204,50 +180,36 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-
           if [ -z "$VERCEL_TOKEN" ]; then
-            python3 "$GITHUB_WORKSPACE/security/ci/platform_client.py" deployment \
+            python3 security/ci/platform_client.py deployment \
               --status failed \
-              --logs "Gate passed, but VERCEL_TOKEN is not configured."
-            exit 0
+              --logs "VERCEL_TOKEN is not configured"
+            exit 1
           fi
-
-          npm install -g vercel@latest >/dev/null
+          npm install -g vercel@latest
           cd "$TARGET"
           rm -rf .git
-
           SCOPE=()
-          if [ -n "${VERCEL_SCOPE:-}" ]; then
-            SCOPE=(--scope "$VERCEL_SCOPE")
-          fi
-
+          if [ -n "${VERCEL_SCOPE:-}" ]; then SCOPE=(--scope "$VERCEL_SCOPE"); fi
           if vercel deploy --prod --yes --token "$VERCEL_TOKEN" \
               "${SCOPE[@]}" > "$RUNNER_TEMP/vercel.out" 2> "$RUNNER_TEMP/vercel.err"; then
             URL=$(grep -Eo 'https://[^[:space:]]+' "$RUNNER_TEMP/vercel.out" | tail -n 1 || true)
           else
             URL=""
           fi
-
           if [[ "${URL:-}" =~ ^https://[^[:space:]]+$ ]]; then
-            python3 "$GITHUB_WORKSPACE/security/ci/platform_client.py" deployment \
-              --status deployed --url "$URL"
+            python3 "$GITHUB_WORKSPACE/security/ci/platform_client.py" \
+              deployment --status deployed --url "$URL"
           else
             ERR=$(tail -c 600 "$RUNNER_TEMP/vercel.err" | tr '\n' ' ')
-            python3 "$GITHUB_WORKSPACE/security/ci/platform_client.py" deployment \
-              --status failed --logs "Vercel deployment failed: $ERR"
+            python3 "$GITHUB_WORKSPACE/security/ci/platform_client.py" \
+              deployment --status failed --logs "Vercel deployment failed: $ERR"
             exit 1
           fi
 
       - name: Report a failed workflow to the platform
-        if: ${{ failure() && !cancelled() }}
+        if: failure() && !cancelled()
         continue-on-error: true
-        shell: bash
         run: |
-          CLIENT="$GITHUB_WORKSPACE/security/ci/platform_client.py"
-
-          if [ -f "$CLIENT" ]; then
-            python3 "$CLIENT" fail \
-              --message "The scan workflow failed. Check earlier failed steps in GitHub Actions."
-          else
-            echo "::warning::Cannot report failure because platform_client.py is missing"
-          fi
+          python3 security/ci/platform_client.py fail \
+            --message "Scan workflow failed. Check GitHub Actions logs."
