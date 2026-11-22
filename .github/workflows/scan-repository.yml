@@ -76,6 +76,17 @@ jobs:
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
           echo "commit=$(git -C "$TARGET" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
+      - name: Verify cloned repository
+        env:
+          TARGET: ${{ steps.clone.outputs.target }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -n "$TARGET"
+          test -d "$TARGET/.git"
+          echo "Repository cloned successfully."
+          echo "Target directory: $TARGET"
+
       - name: Build Docker image if available
         id: image
         env:
@@ -111,20 +122,20 @@ jobs:
         run: bash security/sast/run_semgrep.sh "$TARGET" reports
 
       - name: Run Gitleaks
-        if: always()
+        if: always() && steps.clone.outputs.target != ''
         env:
           TARGET: ${{ steps.clone.outputs.target }}
         run: bash security/secrets/run_gitleaks.sh "$TARGET" reports
 
       - name: Run Trivy
-        if: always()
+        if: always() && steps.clone.outputs.target != ''
         env:
           TARGET: ${{ steps.clone.outputs.target }}
           IMAGE: ${{ steps.image.outputs.name }}
         run: bash security/container/run_trivy.sh "$TARGET" reports "${IMAGE:-}"
 
       - name: Run Dependency-Check
-        if: always()
+        if: always() && steps.clone.outputs.target != ''
         env:
           TARGET: ${{ steps.clone.outputs.target }}
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
@@ -138,7 +149,7 @@ jobs:
 
       - name: Normalize results and evaluate security gate
         id: normalize
-        if: always()
+        if: always() && steps.clone.outputs.target != ''
         env:
           COMMIT: ${{ steps.clone.outputs.commit }}
         shell: bash
@@ -146,6 +157,9 @@ jobs:
           set -euo pipefail
 
           test -f "$RUNNER_TEMP/source.json"
+          test -n "$COMMIT"
+          mkdir -p reports
+
           test -f reports/semgrep.json || echo "::warning::Semgrep report may be missing"
 
           jq .gateConfig "$RUNNER_TEMP/source.json" > reports/gate-config.json
