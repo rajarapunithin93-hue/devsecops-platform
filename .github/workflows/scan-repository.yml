@@ -25,14 +25,20 @@ jobs:
 
     steps:
       - name: Check inputs
+        shell: bash
         run: |
           set -euo pipefail
-          [[ "$SCAN_ID" =~ ^[0-9]+$ ]] || { echo "scan_id must be a number"; exit 1; }
-          [ -n "$BACKEND_URL" ] || { echo "Set the BACKEND_URL repository variable"; exit 1; }
-          [ -n "$SCAN_SECRET" ] || { echo "Set the SCAN_SECRET repository secret"; exit 1; }
+          [[ "$SCAN_ID" =~ ^[0-9]+$ ]] || { echo "::error::scan_id must be a number"; exit 1; }
+          [[ -n "$BACKEND_URL" ]] || { echo "::error::Set BACKEND_URL repository variable"; exit 1; }
+          [[ -n "$SCAN_SECRET" ]] || { echo "::error::Set SCAN_SECRET repository secret"; exit 1; }
 
       - name: Checkout scanner tools
         uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
 
       - name: Mark scan as running
         run: |
@@ -46,15 +52,18 @@ jobs:
 
       - name: Clone the repository to scan
         id: clone
+        shell: bash
         run: |
           set -euo pipefail
           SRC="$RUNNER_TEMP/source.json"
-          REPO=$(jq -r .repository "$SRC")
-          BRANCH=$(jq -r .branch "$SRC")
-          TOKEN=$(jq -r .token "$SRC")
-          SLUG=$(jq -r .slug "$SRC")
 
-          AUTH=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w0)
+          REPO=$(jq -er .repository "$SRC")
+          BRANCH=$(jq -er .branch "$SRC")
+          TOKEN=$(jq -er .token "$SRC")
+          SLUG=$(jq -er .slug "$SRC")
+
+          AUTH=$(printf 'x-access-token:%s' "$TOKEN" | base64 -w 0)
+          echo "::add-mask::$TOKEN"
           echo "::add-mask::$AUTH"
 
           TARGET="$RUNNER_TEMP/target/$SLUG"
@@ -67,70 +76,78 @@ jobs:
           echo "target=$TARGET" >> "$GITHUB_OUTPUT"
           echo "commit=$(git -C "$TARGET" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
-      - name: Build the Docker image (if the repository has a Dockerfile)
+      - name: Build Docker image if available
         id: image
         env:
           TARGET: ${{ steps.clone.outputs.target }}
+        shell: bash
         run: |
+          set -euo pipefail
           if [ -f "$TARGET/Dockerfile" ]; then
             if docker build -t "scan-target:$SCAN_ID" "$TARGET"; then
               echo "name=scan-target:$SCAN_ID" >> "$GITHUB_OUTPUT"
             else
-              echo "::warning::Docker build failed; Trivy will scan the source tree instead"
+              echo "::warning::Docker build failed; Trivy will scan source files"
             fi
           else
-            echo "No Dockerfile; Trivy will scan the source tree"
+            echo "No Dockerfile; Trivy will scan source files"
           fi
-
-      - uses: actions/setup-python@v5
-        with:
-          python-version: "3.12"
 
       - name: Install Semgrep
         run: pip install --quiet semgrep
 
-      - name: Cache the CVE database for Dependency-Check
+      - name: Cache Dependency-Check database
         uses: actions/cache@v4
         with:
-          path: ~/.dependency-check-data
+          path: ${{ runner.temp }}/dependency-check-data
           key: dependency-check-data-v1-${{ runner.os }}-${{ github.run_id }}
           restore-keys: |
             dependency-check-data-v1-${{ runner.os }}-
 
-      - name: Run the four scanners
+      - name: Run Semgrep
+        env:
+          TARGET: ${{ steps.clone.outputs.target }}
+          SEMGREP_CONFIG: p/default
+        run: bash security/sast/run_semgrep.sh "$TARGET" reports
+
+      - name: Run Gitleaks
+        if: always()
+        env:
+          TARGET: ${{ steps.clone.outputs.target }}
+        run: bash security/secrets/run_gitleaks.sh "$TARGET" reports
+
+      - name: Run Trivy
+        if: always()
         env:
           TARGET: ${{ steps.clone.outputs.target }}
           IMAGE: ${{ steps.image.outputs.name }}
+        run: bash security/container/run_trivy.sh "$TARGET" reports "${IMAGE:-}"
+
+      - name: Run Dependency-Check
+        if: always()
+        env:
+          TARGET: ${{ steps.clone.outputs.target }}
           NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
-          SEMGREP_CONFIG: p/default
           PROJECT_NAME: scan-${{ inputs.scan_id }}
+          DEPENDENCY_CHECK_DATA_DIR: ${{ runner.temp }}/dependency-check-data
+        shell: bash
         run: |
-          set -uo pipefail
-          mkdir -p reports
+          set -euo pipefail
+          mkdir -p reports "$DEPENDENCY_CHECK_DATA_DIR"
+          bash security/dependency/run_dependency_check.sh "$TARGET" reports
 
-          echo "Starting Semgrep..."
-          bash security/sast/run_semgrep.sh "$TARGET" reports \
-            || echo "::warning::Semgrep failed"
-
-          echo "Starting Gitleaks..."
-          bash security/secrets/run_gitleaks.sh "$TARGET" reports \
-            || echo "::warning::Gitleaks failed"
-
-          echo "Starting Trivy..."
-          bash security/container/run_trivy.sh "$TARGET" reports "${IMAGE:-}" \
-            || echo "::warning::Trivy failed"
-
-          echo "Starting Dependency-Check..."
-          bash security/dependency/run_dependency_check.sh "$TARGET" reports \
-            || echo "::warning::Dependency-Check failed"
-
-          echo "All scanner commands have finished."
-
-      - name: Normalize results and evaluate the security gate
+      - name: Normalize results and evaluate security gate
+        id: normalize
+        if: always()
         env:
           COMMIT: ${{ steps.clone.outputs.commit }}
+        shell: bash
         run: |
-          set -uo pipefail
+          set -euo pipefail
+
+          test -f "$RUNNER_TEMP/source.json"
+          test -f reports/semgrep.json || echo "::warning::Semgrep report may be missing"
+
           jq .gateConfig "$RUNNER_TEMP/source.json" > reports/gate-config.json
 
           python3 security/normalizer/normalize.py \
@@ -150,11 +167,12 @@ jobs:
 
       - name: Send results to the platform
         id: report
+        if: always() && hashFiles('reports/payload.json') != ''
         run: |
           python3 security/ci/platform_client.py results \
             --payload reports/payload.json
 
-      - name: Upload the security report
+      - name: Upload security report
         if: always()
         uses: actions/upload-artifact@v4
         with:
@@ -165,43 +183,52 @@ jobs:
           if-no-files-found: ignore
           retention-days: 14
 
-      - name: Deploy to Vercel (only when the gate passed)
+      - name: Deploy to Vercel when gate passes
         if: steps.report.outputs.final_status == 'PASS' && steps.report.outputs.deploy == 'true'
         env:
           TARGET: ${{ steps.clone.outputs.target }}
           VERCEL_TOKEN: ${{ secrets.VERCEL_TOKEN }}
           VERCEL_SCOPE: ${{ vars.VERCEL_SCOPE }}
+        shell: bash
         run: |
-          set +e
+          set -euo pipefail
 
           if [ -z "$VERCEL_TOKEN" ]; then
             python3 security/ci/platform_client.py deployment \
               --status failed \
-              --logs "Gate passed, but the VERCEL_TOKEN secret is not set in the scanner repository."
-            exit 0
+              --logs "VERCEL_TOKEN is not configured"
+            exit 1
           fi
 
-          npm install -g vercel@latest >/dev/null 2>&1
-          cd "$TARGET" || exit 0
+          npm install -g vercel@latest
+          cd "$TARGET"
           rm -rf .git
 
           SCOPE=()
-          [ -n "$VERCEL_SCOPE" ] && SCOPE=(--scope "$VERCEL_SCOPE")
+          if [ -n "${VERCEL_SCOPE:-}" ]; then
+            SCOPE=(--scope "$VERCEL_SCOPE")
+          fi
 
-          URL=$(vercel deploy --prod --yes --token "$VERCEL_TOKEN" \
-            "${SCOPE[@]}" 2> "$RUNNER_TEMP/vercel.err" | tail -n 1)
+          if vercel deploy --prod --yes --token "$VERCEL_TOKEN" \
+              "${SCOPE[@]}" > "$RUNNER_TEMP/vercel.out" 2> "$RUNNER_TEMP/vercel.err"; then
+            URL=$(grep -Eo 'https://[^[:space:]]+' "$RUNNER_TEMP/vercel.out" | tail -n 1 || true)
+          else
+            URL=""
+          fi
 
-          if [[ "$URL" =~ ^https://[^[:space:]]+$ ]]; then
+          if [[ "${URL:-}" =~ ^https://[^[:space:]]+$ ]]; then
             python3 "$GITHUB_WORKSPACE/security/ci/platform_client.py" \
               deployment --status deployed --url "$URL"
           else
             ERR=$(tail -c 600 "$RUNNER_TEMP/vercel.err" | tr '\n' ' ')
             python3 "$GITHUB_WORKSPACE/security/ci/platform_client.py" \
               deployment --status failed --logs "Vercel deployment failed: $ERR"
+            exit 1
           fi
 
       - name: Report a failed workflow to the platform
-        if: failure()
+        if: failure() && !cancelled()
+        continue-on-error: true
         run: |
           python3 security/ci/platform_client.py fail \
-            --message "The scan workflow failed. Open the GitHub Actions run for details."
+            --message "Scan workflow failed. Check GitHub Actions logs."
